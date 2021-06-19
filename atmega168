@@ -271,6 +271,7 @@ int main(void)           // меин
 		{
 			buzerstart();
 			razbivaem_chislo (odin_noll);                 // разбиваем число на два знака ( третий это символ)
+			cursor = true;                                // прячем точку
 			procces = false;                              // процесс должен быть полюбому выключен
 		}
 		
