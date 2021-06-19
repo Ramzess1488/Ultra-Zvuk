@@ -1,0 +1,361 @@
+#include <avr/io.h>
+#define F_CPU 8000000UL
+#include <util/delay.h>
+#include <avr/interrupt.h>
+
+
+//------------------------------------------------------------------------------
+// дефайним порты
+//------------------------------------------------------------------------------
+#define BUZERON         PORTC |= 0x01
+#define BUZEROFF        PORTC &= ~0x01
+#define BUZERINVERT     PORTC ^= 0x01
+#define KNOPKAENC     ~ PIND &  0x04
+#define ENCPOVOROT    ~ PIND &  0x10
+#define LEDON           PORTC |= 0x20
+#define LEDOFF          PORTC &= ~0x20
+#define VANNAON         PORTC |= 0x02
+#define VANNAOFF        PORTC &= ~0x02
+#define TRANZISTOR1VKL  PORTD |= 0x80
+#define TRANZISTOR1VIKL PORTD &= ~ 0x80
+#define TRANZISTOR2VKL  PORTB |= 0x01
+#define TRANZISTOR2VIKL PORTB &= ~ 0x01
+#define TRANZISTOR3VKL  PORTB |= 0x02
+#define TRANZISTOR3VIKL PORTB &= ~ 0x02
+#define CHIPSELECTON    PORTB |= 0x04
+#define CHIPSELECTOFF   PORTB &= ~ 0x04
+#define VREMYA 500                                     // время работы бузера
+
+
+//------------------------------------------------------------------------------
+// объявляем переменные
+//------------------------------------------------------------------------------
+volatile uint8_t razr1,razr2,razr3,simvol_num,pik_pik,knopkainkrement,odin_noll;
+volatile uint16_t timer1,timer2,timer3,shag,minute,sekond,prescaler;
+volatile bool prerivanie, tochka1,tochka2,cursor,procces,end,block,nazhatie_knop,yderzhanie_knop,endprog,buzergo,rezhim_nastroiki,rezhim_raboti,rezhim_preriv,vkl_vikl;
+
+const uint8_t segmenti [20] =  {      // преобразование цифры в 7 сегментный знак там где 0 горит
+	// 0
+	0x28,
+	// 1
+	0xEB,
+	// 2
+	0x32,
+	// 3
+	0xA2,
+	// 4
+	0xE1,
+	// 5
+	0xA4,
+	// 6
+	0x24,
+	// 7
+	0xEA,
+	// 8
+	0x20,
+	// 9
+	0xA0,
+	// P
+	0x70
+};
+
+//------------------------------------------------------------------------------
+// объявляем прототипы функций
+//------------------------------------------------------------------------------
+void init (void);
+void peredacha_spi (int razryad);
+void razbivaem_chislo (unsigned int vhod_chislo);
+void razbivaem_chislo_more10 (unsigned int vhod_chislo1,unsigned int vhod_chislo2);
+void razbivaem_chislo_less10 (unsigned int vhod_chislo1,unsigned int vhod_chislo2);
+void buzerend (void);
+void buzerstart (void);
+
+
+
+ISR ( INT1_vect )        // прерывания от энкодера
+{
+	if (ENCPOVOROT)      // если второй пин энкодера уже сработал то мы поворачиваем в право
+	{
+		if (minute < 30 && rezhim_raboti){      // ограничение на максимальное время работы и инкрементируется только в нормальном режиме работы
+			minute ++;                          // плюсуем минуты
+			endprog = false;                    // сбрасываем флаг конца выполнение программы
+			block = false;                      // сбрасываем флаг повторного попадания в функцию окончания программы
+			
+		}
+		if (rezhim_nastroiki) odin_noll = 1 ;  // если мы в режиме настройки переводим режим в состояние 1
+		buzergo = true;                        // пикаем
+	}
+	else                                        // если сработало прерывание от энкодера а второй пин еще не нажат то мы крутимся влево
+	{
+		if (minute >= 2 && rezhim_raboti){      // ограничение на минимальное время работы и декрементируется только в нормальном режиме работы
+			minute --;                          // минусуем минуты
+		}
+		if (rezhim_nastroiki) odin_noll = 0 ;   // если мы в режиме настройки переводим режим в состояние 0
+		buzergo = true;                        // пикаем
+	}
+	
+}
+
+ISR (TIMER0_OVF_vect){   // прерывание от таймера 0
+	
+	simvol_num ++;        // инкрементируем переменную счетчик включения транзисторов
+	
+	switch (simvol_num)           // отображение символов, каждый раз значения кейса меняется и следовательно показываем следующий символ
+	{
+		case 1:
+		TRANZISTOR3VKL;          // отпустили транзистор предыдцщего кейса (так как тут пнп то + это выключено)
+		if (rezhim_raboti ){     // если мы в режиме работы
+			if (tochka1 || cursor)peredacha_spi (segmenti [razr1] ); // если включена точка или курсор передали в spi символ из массива под номером который выдала функция разбивки числа на символы
+			else peredacha_spi (segmenti [razr1] ^ 0x20  );          // если точка не заблокирована передали ее в spi + символ из массива под номером который выдала функция разбивки числа на символы  ^ 0x20
+		}
+		if (rezhim_nastroiki ){                                      // если включен режим настройки показывать букву Р
+			peredacha_spi (segmenti [10]);
+		}
+		TRANZISTOR1VIKL;                                             // включили следующий транзистор динамической индикации
+		break;
+		
+		case 2:
+		TRANZISTOR1VKL;
+		if (tochka2 || cursor) peredacha_spi (segmenti [razr2]  );
+		else peredacha_spi (segmenti [razr2] ^ 0x20);
+		TRANZISTOR2VIKL;
+		break;
+		
+		case 3:
+		TRANZISTOR2VKL;
+		peredacha_spi (segmenti [razr3]);
+		TRANZISTOR3VIKL;
+		break;
+	}
+	if (simvol_num == 3)        // когда достигли 3х обнуляемся чтоб показывать снова первый символ
+	{
+		simvol_num = 0;
+	}
+	
+	if (KNOPKAENC){             // отслеживаем кнопку енкодера
+		knopkainkrement ++;     // если нажата инкрементируем
+		if (knopkainkrement >= 210) knopkainkrement = 210;      // если значение больше 210 сделать 210 для защиты от переполнения переменной
+		if (knopkainkrement == 200) buzergo = true;             // если значение стало 200 пикнуть, чтоб дать понять удержание кнопки
+	}
+	else                                                        // если нажатия нету
+	{
+		if (knopkainkrement >= 20 && knopkainkrement < 200) {   // проверяем переменную кнопки на количество. если больше 20 и меньше 200
+			if(rezhim_raboti) nazhatie_knop = true;             // и мы находимся в режиме работы то это нажатие на кнопку
+			buzergo = true;                                     // пикнуть
+		}
+		
+		if (knopkainkrement > 200){                             // если переменная кнопки выше 200
+			yderzhanie_knop = true;                             // считаем это удержанием
+		}
+		knopkainkrement = 0;                                    // обнуляем переменную кнопки
+		
+	}
+	
+}
+
+ISR (TIMER1_COMPA_vect){      // прерывание от 1 таймера
+	
+	if (procces){
+		// если запущен процесс работы
+		if (odin_noll == 1){              // и установлен режим прерывистой работы
+			
+			if (!vkl_vikl){               // согласно значению флага
+				LEDON;                    // включаем светик
+				VANNAON;                  // и ванну
+			}
+			if (vkl_vikl){                // согласно значению флага
+				LEDOFF;                   // выключаем светик
+				VANNAOFF;                 // и ванну
+			}
+		}
+		else {                            // если установлен режим постоянной работы
+			LEDON;                        // включаем светик
+			VANNAON;                      // и ванну
+		}
+		
+		if (sekond == 0)                  // если секунды = 0
+		{
+			if (minute > 0)               // если минут больше 0
+			{
+				minute --;                // отнимаем у минут единичку
+				sekond = 60;              // устанавливаем значение секунд в 30
+			}
+		}
+		if (sekond > 0)                   // если секунд больше 0
+		{
+			sekond --;                    // отнимаем одну
+			cursor = !cursor;             // инвертируем состояние курсора для отображения на 7 сегментном
+		}
+		else {                            // если секунд не осталось
+			endprog = true;               // поднимаем флаг окончания работы
+			procces = false;              // выключаем процесс
+		}
+	}
+	else {                                // если процесс не запущен
+		LEDOFF;                           // выключаем светик
+		VANNAOFF;                         // выключаем ванну
+	}
+	
+	
+	timer3 ++;                            // инкрементируем значение таймера для прерывистого режима работы
+	if (timer3 >= 2){                     // когда таймер достиг 2
+		vkl_vikl = !vkl_vikl;             // инвертируем значение флага для включения/выключения ( в прерывистом режиме работы)
+		timer3 = 0;                       // обнуляем таймер
+	}
+	
+}
+
+ISR (TIMER2_OVF_vect){     // прерывания по переполнению 2 таймера
+	
+	
+	if (timer1 <= 1) timer1 = 1;      // если таймер меньше 1 таймер = 1
+	timer1 --;                        // деркементируем таймер
+	if (timer2 <= 1) timer2 = 1;      // если таймер меньше 1 таймер = 1
+	timer2 --;                        // декрементируем таймер
+}
+
+
+int main(void)           // меин
+{
+	init();              // инициализация
+	minute = 5;          // первоначальное значение минут
+	cursor = false;      // сброс флага
+	rezhim_nastroiki = false;    // выключаем режим настройки
+	rezhim_raboti = true;        // включаем режим работы
+	
+	for (;;)
+	{
+		if (yderzhanie_knop){                            // если отследили удержание кнопки
+			rezhim_nastroiki = !rezhim_nastroiki;        // инвертируем флаг режима настройки
+			rezhim_raboti = !rezhim_raboti;              // инвертируем флаг режима работы. таким образом мы перешли из одного режима в другой
+			yderzhanie_knop = false;                     // сбросили флаг удержаной кнопки
+		}
+		
+		if (rezhim_raboti){                              // если мы находимся в режиме работы
+			
+			if ( nazhatie_knop && !procces && (sekond > 0 || minute >0) ){
+				// если произошло нажатие кнопки и процесс остановлен и секунд или минут больше 0 (за режим перехода с 1 минуты в 0 и там как раз будет 0 сек, не переживаем. оно все в прерывании и мы не попадем туда)
+				procces = true;                          // запустить процесс
+				nazhatie_knop = false;                   // сбросить флаг кнопки
+			}
+			if ( nazhatie_knop && procces){              // если кнопка нажата и запущен процесс
+				procces = false;                         // остановить процесс
+				nazhatie_knop = false;                   // сбросить флаг кнопки
+				if (sekond !=0 ) cursor = false;         // вывести точки при паузе, чтоб было видно минуты/секунды
+			}
+			
+			
+			if (minute >= 10){                            // если минут больше или = 10
+				razbivaem_chislo_more10 (minute,sekond);  // разбиваем число так чтоб после запятой был один знак секунд
+				tochka1 = true;                           // переносим точку
+				tochka2 = false;                          // переносим точку
+				if (!procces) cursor = false;             // если процесс остановлен включить точку во втором символе
+			}
+			if (minute < 10) {                            // если минут меньше 10
+				razbivaem_chislo_less10 (minute,sekond);  // разбиваем число так чтоб было 2 знака секунд
+				tochka1 = false;                          // переносим точку
+				tochka2 = true;                           // переносим точку
+				if (!procces && minute !=0 ) cursor = false; // если процесс остановлен и минуты не = 0 включаем точку в первом символе
+			}
+			
+			if ( !block && endprog) {                     // если опущен флаг повторного попадания в данный блок и конец программы
+				cursor = true;                            // прячем точку
+				block = true;                             // поднимаем флаг чтоб сюда не заходить
+				end = true;                               // поднимаем флаг бузеру
+			}
+			buzerstart();
+			buzerend ();
+		}
+		
+		if (rezhim_nastroiki)                              // если мы в режиме настройки
+		{
+			buzerstart();
+			razbivaem_chislo (odin_noll);                 // разбиваем число на два знака ( третий это символ)
+			procces = false;                              // процесс должен быть полюбому выключен
+		}
+		
+		
+		
+		
+	}
+}
+
+void init (void){
+	
+	//--инициализируем прерывания -- //
+	EICRA = 0x08;            // прерывания по спаду
+	EIMSK = 0x02;	         // разрешить прерывания INT1
+	//--инициализируем таймер T0-- //
+	TIMSK0=0x01;            // включаем прерывания по переполнению
+	TCCR0B=0x03;            // делитель тактовой частоты на 8
+	//--инициализируем таймер T1-- //
+	TIMSK1 = 0x02;            // включаем прерывания по sravn
+	TCCR1B = 0x0D;          // делитель тактовой частоты на 1024      0x0D; 0x0B;
+	OCR1A = 0x1E84;
+	//--инициализируем таймер T2-- //
+	TIMSK2 = 0x01;            // включаем прерывания по переполнению
+	TCCR2B = 0x03;            // делитель тактовой частоты на 64
+	
+
+	//--инициализируем spi и порты-- //
+	DDRD = 0x80;
+	DDRB = 0x3F;            // Ножки SPI на выход
+	DDRC = 0x23;
+	PORTD = 0x1C;
+	sei();                  // разрешаем прерывания
+}
+void peredacha_spi (int razryad)            // передача знака
+{
+	SPCR = ((1<<SPE)|(1<<MSTR));    //Включим шину, объявим ведущим
+	SPDR = razryad;                 // передадим разряд
+	while (!(SPSR&(1<<SPIF)));      // ждем пока передадутся данные
+	CHIPSELECTON;                   // включим
+	CHIPSELECTOFF;                  // выключим чип селект
+}
+void razbivaem_chislo (unsigned int vhod_chislo)  // разбиваем число на 3 разряда
+{
+	razr2 = vhod_chislo%100/10;        // десятки
+	razr3 = vhod_chislo%10;            // единицы
+}
+void razbivaem_chislo_less10 (unsigned int vhod_chislo1,unsigned int vhod_chislo2)  // разбиваем число на 3 разряда
+{
+	razr1 = vhod_chislo1 ;              // без изменений
+	razr2 = vhod_chislo2%100/10;        // десятки
+	razr3 = vhod_chislo2%10;            // единицы
+}
+void razbivaem_chislo_more10 (unsigned int vhod_chislo1,unsigned int vhod_chislo2)  // разбиваем число на 3 разряда
+{
+	
+	razr1 = vhod_chislo1%100/10;        // десятки
+	razr2 = vhod_chislo1%10;            // единицы
+	razr3 = vhod_chislo2%100/10;        // десятки
+}
+void buzerend (void){
+	if (end && pik_pik <= 6  && timer1 <= 2)           // если есть разрешение бузеру и пик-пик меньше 6 и таймер меньше 2
+	{
+		BUZERINVERT;                                   // инвертируем бузер
+		timer1 = VREMYA;                               // устанавливаем длительность пиканья
+		pik_pik ++;                                    // инкрементируем переменную
+	}
+
+	if (pik_pik  == 6)                                 // если она достигла 6
+	{
+		pik_pik = 0;                                   // обнуляем
+		BUZEROFF;                                      // выключаем бузер
+		end = false;                                   // запрещаем работу бузеру
+	}
+}
+void buzerstart (void){                                // пикнуть при повороте/нажатии
+	if (buzergo && timer2 <= 2)                        // если поднят флаг и таймер меньше 2
+	{
+		timer2 = 50;                                   // задаем обратный отсчет
+		BUZERON;                                       // включаем бузер
+		buzergo = false;                               // сбрасываем флаг бузера
+	}
+	if (!buzergo && timer2 <= 2 && !end)               // если бузер сброшен и таймер досчитал до 2 и в предыдущем цикле мы не мешаем
+	{
+		
+		BUZEROFF;                                      // выключить бузер
+	}
+	
+}
